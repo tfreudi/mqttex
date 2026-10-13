@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho"
@@ -25,15 +28,24 @@ const (
 	StateConnected    = "connected"
 )
 
+// ackTimeout bounds the wait for SUBACK and UNSUBACK. The broker queues them
+// behind the publishes it already has on the way to us; with "#" on a busy
+// broker that backlog is regularly longer than paho's default of 10 s.
+const ackTimeout = 2 * time.Minute
+
+// ErrNotConnected is returned by operations that need a live broker connection.
+var ErrNotConnected = errors.New("not connected to a broker")
+
 // Status is what the UI shows about the connection.
 type Status struct {
 	State         string   `json:"state"`
 	ProfileID     string   `json:"profileId,omitempty"`
 	ProfileName   string   `json:"profileName,omitempty"`
 	ClientID      string   `json:"clientId,omitempty"`
-	Subscriptions []string `json:"subscriptions,omitempty"`
-	Error         string   `json:"error,omitempty"`     // why the connection is not up
-	SubErrors     []string `json:"subErrors,omitempty"` // filters the broker rejected
+	Subscriptions []string `json:"subscriptions,omitempty"` // filters currently subscribed
+	Focus         bool     `json:"focus,omitempty"`         // Subscriptions were narrowed by Focus
+	Error         string   `json:"error,omitempty"`         // why the connection is not up
+	SubErrors     []string `json:"subErrors,omitempty"`     // filters the broker rejected
 }
 
 type Manager struct {
@@ -44,6 +56,16 @@ type Manager struct {
 	cm     *autopaho.ConnectionManager
 	cancel context.CancelFunc
 	status Status
+	// profileSubs are the filters of the connected profile, active the ones
+	// subscribed right now; a reconnect restores active, not profileSubs.
+	profileSubs []string
+	active      []string
+
+	focusMu sync.Mutex // serializes Focus so a later call cannot be overtaken
+	// accept is the focus while one is set. Publishes already queued in paho
+	// when the old filters were dropped still arrive after the store reset;
+	// they are discarded instead of reappearing in the tree. nil accepts all.
+	accept atomic.Pointer[[]string]
 }
 
 func New(s *store.Store) *Manager {
@@ -78,6 +100,7 @@ func (m *Manager) Connect(p profiles.Profile) error {
 	m.gen++
 	gen := m.gen
 	m.status = Status{State: StateConnecting, ProfileID: p.ID, ProfileName: p.Name, ClientID: clientID, Subscriptions: p.Subscriptions}
+	m.profileSubs, m.active = p.Subscriptions, p.Subscriptions
 
 	update := func(f func(*Status)) {
 		m.mu.Lock()
@@ -98,7 +121,13 @@ func (m *Manager) Connect(p profiles.Profile) error {
 		OnConnectionUp: func(cm *autopaho.ConnectionManager, _ *paho.Connack) {
 			update(func(s *Status) { s.State, s.Error, s.SubErrors = StateConnected, "", nil })
 			go func() {
-				failed := subscribe(cm, p.Subscriptions)
+				m.mu.Lock()
+				filters, current := m.active, m.gen == gen
+				m.mu.Unlock()
+				if !current {
+					return
+				}
+				failed := subscribe(cm, filters)
 				update(func(s *Status) { s.SubErrors = failed })
 			}()
 		},
@@ -110,7 +139,8 @@ func (m *Manager) Connect(p profiles.Profile) error {
 			update(func(s *Status) { s.State, s.Error = StateConnecting, err.Error() })
 		},
 		ClientConfig: paho.ClientConfig{
-			ClientID: clientID,
+			ClientID:      clientID,
+			PacketTimeout: ackTimeout, // caps every context passed to paho
 			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
 				func(pr paho.PublishReceived) (bool, error) {
 					m.ingest(pr.Packet)
@@ -142,6 +172,9 @@ func (m *Manager) Connect(p profiles.Profile) error {
 }
 
 func (m *Manager) ingest(p *paho.Publish) {
+	if accept := m.accept.Load(); accept != nil && !matchesAny(*accept, p.Topic) {
+		return
+	}
 	msg := store.Message{Time: time.Now(), Payload: p.Payload, QoS: p.QoS, Retain: p.Retain}
 	if pp := p.Properties; pp != nil {
 		msg.ContentType = pp.ContentType
@@ -155,11 +188,105 @@ func (m *Manager) ingest(p *paho.Publish) {
 	m.store.Ingest(p.Topic, msg)
 }
 
+// Focus replaces the active subscriptions with filters and rebuilds the topic
+// tree from what they deliver. No filters restores the profile subscriptions.
+// Unsubscribe comes before the reset so the fresh tree only receives the new
+// filters, and subscribe after it so their retained messages land in it.
+// The UNSUBACK also marks the end of the old backlog: a broker still busy
+// flushing it may drop the retained messages of a new subscription, so the
+// subscribe has to wait for it.
+func (m *Manager) Focus(filters []string) error {
+	m.focusMu.Lock()
+	defer m.focusMu.Unlock()
+
+	focus := len(filters) > 0
+	m.mu.Lock()
+	cm, gen, old := m.cm, m.gen, m.active
+	if cm == nil || m.status.State != StateConnected {
+		m.mu.Unlock()
+		return ErrNotConnected
+	}
+	if focus {
+		filters = slices.Clone(filters)
+	} else {
+		filters = m.profileSubs
+	}
+	// Set before the network calls so a reconnect meanwhile subscribes the new filters.
+	m.active = filters
+	m.mu.Unlock()
+
+	var errs []string
+	if len(old) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
+		_, err := cm.Unsubscribe(ctx, &paho.Unsubscribe{Topics: old})
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("unsubscribe failed: %v", err))
+		}
+	}
+
+	// Under m.mu so a concurrent Connect cannot have its fresh tree wiped.
+	m.mu.Lock()
+	if m.gen != gen {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: the connection changed while switching the focus", ErrNotConnected)
+	}
+	if focus {
+		m.accept.Store(&filters)
+	} else {
+		m.accept.Store(nil)
+	}
+	m.store.Reset()
+	m.mu.Unlock()
+
+	errs = append(errs, subscribe(cm, filters)...)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen != gen {
+		return fmt.Errorf("%w: the connection changed while switching the focus", ErrNotConnected)
+	}
+	m.status.Subscriptions, m.status.Focus, m.status.SubErrors = filters, focus, errs
+	return nil
+}
+
+// matchesAny reports whether topic matches one of the MQTT topic filters.
+func matchesAny(filters []string, topic string) bool {
+	for _, f := range filters {
+		if matches(f, topic) {
+			return true
+		}
+	}
+	return false
+}
+
+func matches(filter, topic string) bool {
+	// Wildcards in the first level do not match the broker's $-topics.
+	if strings.HasPrefix(topic, "$") && (strings.HasPrefix(filter, "+") || strings.HasPrefix(filter, "#")) {
+		return false
+	}
+	for {
+		fl, frest, fmore := strings.Cut(filter, "/")
+		if fl == "#" {
+			return true
+		}
+		tl, trest, tmore := strings.Cut(topic, "/")
+		if fl != "+" && fl != tl {
+			return false
+		}
+		if !fmore || !tmore {
+			// "a/#" also matches "a" itself.
+			return fmore == tmore || (!tmore && frest == "#")
+		}
+		filter, topic = frest, trest
+	}
+}
+
 // subscribe returns a description of every filter the broker rejected.
 // The Suback is inspected even when paho reports an error, since a rejected
 // filter is exactly the case the user needs to see.
 func subscribe(cm *autopaho.ConnectionManager, filters []string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
 	defer cancel()
 
 	sub := &paho.Subscribe{}
@@ -209,6 +336,7 @@ func (m *Manager) Disconnect() {
 	m.cm, m.cancel = nil, nil
 	m.gen++
 	m.status = Status{State: StateDisconnected}
+	m.accept.Store(nil)
 	m.mu.Unlock()
 
 	if cm == nil {
@@ -239,7 +367,7 @@ func (m *Manager) Publish(req PublishRequest) error {
 	cm, state := m.cm, m.status.State
 	m.mu.Unlock()
 	if cm == nil || state != StateConnected {
-		return errors.New("not connected to a broker")
+		return ErrNotConnected
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

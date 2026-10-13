@@ -66,6 +66,8 @@ With a filter active, **Compare matches** next to the filter adds all matching t
 
 While the Compare tab is open, it gets the full payload of each topic (up to 64 KB), independent of the shortened previews in the tree. Values longer than 200 characters are cut in their cell and end with a hash, so values that only differ further in still count as different; binary payloads show their size and a hash.
 
+**Only compared devices** takes the load off when the profile subscribes to a busy broker (say `#` with 100k topics) but you only look at a few devices. Instead of the profile subscriptions, mqttex then subscribes to the whole device of each compared topic, `/topic/{SN}/#` for `/topic/{SN}/V0/post/json`, and nothing else. Switching it on, and every change to the comparison while it is on, rebuilds the topic tree: retained values show up at once, the rest with the next message. **Add device** then no longer needs the topic to be in the tree, since it only arrives once it is subscribed. The top bar shows `focus: N devices` while it is active. Switching it off, or emptying the comparison, restores the profile subscriptions. The setting is kept in the browser; a new connection starts on the profile subscriptions and the browser narrows them again once it is connected.
+
 ## How it handles the load
 
 - **Ingest is one map lookup.** Every message updates an in-memory topic table (about 20 ns, no allocation). Nothing is written to disk and no per-message event is emitted.

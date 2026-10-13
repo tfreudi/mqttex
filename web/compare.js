@@ -169,20 +169,56 @@ export function deviceTopics(names, value) {
   if (v.includes('/')) return [v];
   const parts = names.map((n) => n.split('/'));
   const out = new Set();
-  const add = (p, keep) => {
-    const at = [];
-    p.forEach((s, i) => {
-      if (keep(s, i)) at.push(i);
-    });
+  const add = (p, at) => {
     for (const i of rank(p, at, v)) out.add([...p.slice(0, i), v, ...p.slice(i + 1)].join('/'));
   };
-  for (const p of parts) {
-    const peers = parts.filter((q) => q !== p && q.length === p.length);
-    add(p, (s, i) => peers.some((q) => q[i] !== s));
-  }
+  for (const p of parts) add(p, differingSegments(parts, p));
   const digit = /\d/.test(v);
-  for (const p of parts) add(p, (s) => s !== '' && (digit ? /\d/.test(s) : s.length === v.length));
+  for (const p of parts) add(p, segments(p, (s) => s !== '' && (digit ? /\d/.test(s) : s.length === v.length)));
   return [...out];
+}
+
+// Indexes of the segments of p in which compared topics of the same depth
+// differ, see deviceTopics.
+function differingSegments(parts, p) {
+  const peers = parts.filter((q) => q !== p && q.length === p.length);
+  return segments(p, (s, i) => peers.some((q) => q[i] !== s));
+}
+
+function segments(p, keep) {
+  const at = [];
+  p.forEach((s, i) => {
+    if (keep(s, i)) at.push(i);
+  });
+  return at;
+}
+
+// Broker filters that cover the whole device of each compared topic, e.g.
+// /topic/SN1/V0/post/json -> /topic/SN1/#, so its other topics (response, ...)
+// arrive as well. The device segment is found as in deviceTopics, without a
+// typed value: where compared topics of the same depth differ, then segments
+// with a digit, ranked the same way. A segment with a digit is preferred, so
+// post next to resp of one device does not split it in two. A topic whose
+// device cannot be told is subscribed to as it is.
+export function deviceFilters(names) {
+  const unique = [...new Set(names)];
+  const parts = unique.map((n) => n.split('/'));
+  const filters = parts.map((p, i) => {
+    const at = [...rank(p, differingSegments(parts, p), ''), ...rank(p, segments(p, (s) => /\d/.test(s)), '')].filter((j) => p[j] !== '');
+    const device = at.find((j) => /\d/.test(p[j])) ?? at[0];
+    return device === undefined ? unique[i] : [...p.slice(0, device + 1), '#'].join('/');
+  });
+  return withoutCovered([...new Set(filters)]);
+}
+
+// Overlapping filters would deliver a message twice and count one device twice:
+// a/# already covers a, a/x/# and a/x/y.
+function withoutCovered(filters) {
+  return filters.filter((f) => !filters.some((g) => {
+    if (g === f || !g.endsWith('/#')) return false;
+    const base = g.slice(0, -2);
+    return f === base || f.startsWith(`${base}/`);
+  }));
 }
 
 // The topic Add device takes from the guesses of deviceTopics. lookups map a

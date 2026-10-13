@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -324,6 +328,270 @@ func TestEndToEndBrokerToBrowser(t *testing.T) {
 	e.do("POST", "/api/disconnect", nil, nil)
 	if code, body := e.do("POST", "/api/publish", req, nil); code != 400 || !strings.Contains(fmt.Sprint(body["error"]), "not connected") {
 		t.Fatalf("publish while disconnected = %d %v", code, body)
+	}
+}
+
+func (s *wsSession) nameList() string {
+	list := make([]string, 0, len(s.names))
+	for _, n := range s.names {
+		list = append(list, n)
+	}
+	sort.Strings(list)
+	return strings.Join(list, " ")
+}
+
+func (s *wsSession) has(name string) bool {
+	for _, n := range s.names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFocusNarrowsTheSubscription(t *testing.T) {
+	mq, port := startBroker(t)
+	e := newEnv(t)
+	p, err := e.book.Save(profiles.Profile{Name: "local", Protocol: "mqtt", Host: "127.0.0.1", Port: port,
+		Subscriptions: []string{"#"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := map[string][]string{"filters": {"/topic/SN000001/#"}}
+	if code, body := e.do("POST", "/api/focus", device, nil); code != 409 || !strings.Contains(fmt.Sprint(body["error"]), "not connected") {
+		t.Fatalf("focus while disconnected = %d %v", code, body)
+	}
+
+	publish := func(topic string, retain bool) {
+		t.Helper()
+		if err := mq.Publish(topic, []byte("v"), retain, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, topic := range []string{"/topic/SN000001/a", "/topic/SN000001/b", "/topic/SN000002/a", "other/x"} {
+		publish(topic, true)
+	}
+	if code, body := e.do("POST", "/api/connect", map[string]string{"id": p.ID}, nil); code != 200 {
+		t.Fatalf("connect = %d %v", code, body)
+	}
+	ws := e.dialWS()
+	ws.readUntil("the retained topics", func() bool { return len(ws.names) == 4 })
+
+	epoch := ws.last.Epoch
+	code, body := e.do("POST", "/api/focus", device, nil)
+	if code != 200 || body["focus"] != true || fmt.Sprint(body["subscriptions"]) != "[/topic/SN000001/#]" {
+		t.Fatalf("focus = %d %v", code, body)
+	}
+	ws.readUntil("the focused tree", func() bool { return ws.last.Epoch != epoch && len(ws.names) == 2 })
+	if got := ws.nameList(); got != "/topic/SN000001/a /topic/SN000001/b" {
+		t.Fatalf("focused tree = %s", got)
+	}
+	// The last publish is a barrier: the broker delivers in order, so the
+	// others would have arrived before it if they were still subscribed.
+	publish("/topic/SN000002/live", false)
+	publish("other/live", false)
+	publish("/topic/SN000001/live", false)
+	ws.readUntil("the focused live topic", func() bool { return ws.has("/topic/SN000001/live") })
+	if got := ws.nameList(); got != "/topic/SN000001/a /topic/SN000001/b /topic/SN000001/live" {
+		t.Fatalf("focused tree after live publishes = %s", got)
+	}
+
+	// A reconnect keeps the focus instead of falling back to the profile.
+	cl, ok := mq.Clients.Get(e.br.Status().ClientID)
+	if !ok {
+		t.Fatal("client not found in the broker")
+	}
+	cl.Stop(errors.New("kicked by the test"))
+	// autopaho reconnects at once, too fast to watch its state; the broker
+	// sees the new session and its subscriptions.
+	e.waitFor("the resubscription", func() bool {
+		next, ok := mq.Clients.Get(e.br.Status().ClientID)
+		return ok && next != cl && len(next.State.Subscriptions.GetAll()) > 0
+	})
+	next, _ := mq.Clients.Get(e.br.Status().ClientID)
+	if subs := next.State.Subscriptions.GetAll(); len(subs) != 1 || subs["/topic/SN000001/#"].Filter == "" {
+		t.Fatalf("subscriptions after the reconnect = %v", subs)
+	}
+	e.waitFor("the reconnect", func() bool { return e.br.Status().State == broker.StateConnected })
+	publish("/topic/SN000002/b", true)
+	publish("/topic/SN000001/c", true)
+	ws.readUntil("the retained topic after the reconnect", func() bool { return ws.has("/topic/SN000001/c") })
+	publish("/topic/SN000002/live2", false)
+	publish("/topic/SN000001/live2", false)
+	ws.readUntil("the live topic after the reconnect", func() bool { return ws.has("/topic/SN000001/live2") })
+	if got := ws.nameList(); got != "/topic/SN000001/a /topic/SN000001/b /topic/SN000001/c /topic/SN000001/live /topic/SN000001/live2" {
+		t.Fatalf("focused tree after the reconnect = %s", got)
+	}
+	if s := e.br.Status(); !s.Focus || len(s.Subscriptions) != 1 || s.Subscriptions[0] != "/topic/SN000001/#" {
+		t.Fatalf("status after the reconnect = %+v", s)
+	}
+
+	tooMany := make([]string, 33)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("/topic/SN%06d/#", i)
+	}
+	for name, filters := range map[string][]string{
+		"too many filters": tooMany,
+		"empty filter":     {""},
+		"long filter":      {strings.Repeat("a", 1025)},
+		"invalid filter":   {"a/#/b"},
+	} {
+		if code, body := e.do("POST", "/api/focus", map[string][]string{"filters": filters}, nil); code != 400 {
+			t.Errorf("%s: focus = %d %v, want 400", name, code, body)
+		}
+	}
+
+	// No filters restore the profile subscriptions.
+	epoch = ws.last.Epoch
+	code, body = e.do("POST", "/api/focus", map[string][]string{"filters": {}}, nil)
+	if code != 200 || body["focus"] != nil || fmt.Sprint(body["subscriptions"]) != "[#]" {
+		t.Fatalf("unfocus = %d %v", code, body)
+	}
+	ws.readUntil("the whole tree", func() bool { return ws.last.Epoch != epoch && len(ws.names) == 6 })
+	if got := ws.nameList(); got != "/topic/SN000001/a /topic/SN000001/b /topic/SN000001/c /topic/SN000002/a /topic/SN000002/b other/x" {
+		t.Fatalf("tree after unfocus = %s", got)
+	}
+
+	// A new connect drops the focus.
+	if code, _ := e.do("POST", "/api/focus", device, nil); code != 200 {
+		t.Fatalf("second focus = %d", code)
+	}
+	code, body = e.do("POST", "/api/connect", map[string]string{"id": p.ID}, nil)
+	if code != 200 || body["focus"] != nil || fmt.Sprint(body["subscriptions"]) != "[#]" {
+		t.Fatalf("connect after focus = %d %v", code, body)
+	}
+	ws.readUntil("the profile subscription", func() bool { return ws.has("other/x") })
+
+	e.do("POST", "/api/disconnect", nil, nil)
+	if code, _ := e.do("POST", "/api/focus", device, nil); code != 409 {
+		t.Fatalf("focus after disconnect = %d", code)
+	}
+}
+
+// gatedProxy forwards a TCP connection to the broker and can hold back
+// everything the broker sends, like a client that is seconds behind a busy
+// subscription: acks queue behind the publishes already on their way.
+type gatedProxy struct {
+	mu   sync.Mutex
+	open chan struct{} // closed while traffic flows
+}
+
+func startProxy(t *testing.T, target int) (*gatedProxy, int) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	g := &gatedProxy{open: make(chan struct{})}
+	close(g.open)
+	go func() {
+		for {
+			client, err := l.Accept()
+			if err != nil {
+				return
+			}
+			upstream, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", target))
+			if err != nil {
+				client.Close()
+				continue
+			}
+			t.Cleanup(func() { client.Close(); upstream.Close() })
+			go io.Copy(upstream, client)
+			go func() {
+				buf := make([]byte, 32<<10)
+				for {
+					n, err := upstream.Read(buf)
+					if err != nil {
+						client.Close()
+						return
+					}
+					g.mu.Lock()
+					open := g.open
+					g.mu.Unlock()
+					<-open
+					if _, err := client.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return g, l.Addr().(*net.TCPAddr).Port
+}
+
+func (g *gatedProxy) hold() {
+	g.mu.Lock()
+	g.open = make(chan struct{})
+	g.mu.Unlock()
+}
+
+func (g *gatedProxy) release() {
+	g.mu.Lock()
+	close(g.open)
+	g.mu.Unlock()
+}
+
+// On a busy broker the UNSUBACK arrives only after the backlog of old
+// publishes, often later than paho's default 10 s packet timeout. Focus must
+// wait for it: subscribing while the backlog is still queued loses the
+// retained messages on the real broker.
+func TestFocusWaitsForSlowAcks(t *testing.T) {
+	mq, brokerPort := startBroker(t)
+	proxy, port := startProxy(t, brokerPort)
+	e := newEnv(t)
+	p, err := e.book.Save(profiles.Profile{Name: "slow", Protocol: "mqtt", Host: "127.0.0.1", Port: port,
+		Subscriptions: []string{"#"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mq.Publish("/topic/SN000001/a", []byte("v"), true, 0)
+	mq.Publish("/topic/SN000002/a", []byte("v"), true, 0)
+	if code, body := e.do("POST", "/api/connect", map[string]string{"id": p.ID}, nil); code != 200 {
+		t.Fatalf("connect = %d %v", code, body)
+	}
+	ws := e.dialWS()
+	ws.readUntil("the retained topics", func() bool { return len(ws.names) == 2 })
+
+	proxy.hold()
+	for i := 0; i < 200; i++ {
+		mq.Publish(fmt.Sprintf("backlog/%d", i), []byte("old"), false, 0)
+	}
+	type result struct {
+		code   int
+		status broker.Status
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		req, _ := http.NewRequest("POST", e.http.URL+"/api/focus", strings.NewReader(`{"filters":["/topic/SN000001/#"]}`))
+		req.Header.Set("Content-Type", "application/json")
+		res, err := e.client.Do(req)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer res.Body.Close()
+		var st broker.Status
+		json.NewDecoder(res.Body).Decode(&st)
+		done <- result{code: res.StatusCode, status: st}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("focus returned while the broker's acks were held back: %+v", r)
+	case <-time.After(11 * time.Second):
+	}
+	epoch := ws.last.Epoch
+	proxy.release()
+	r := <-done
+	if r.err != nil || r.code != 200 || !r.status.Focus || len(r.status.SubErrors) != 0 {
+		t.Fatalf("focus = %+v", r)
+	}
+	ws.readUntil("the focused retained topic", func() bool { return ws.last.Epoch != epoch && ws.has("/topic/SN000001/a") })
+	mq.Publish("/topic/SN000001/live", []byte("v"), false, 0)
+	ws.readUntil("the focused live topic", func() bool { return ws.has("/topic/SN000001/live") })
+	if got := ws.nameList(); got != "/topic/SN000001/a /topic/SN000001/live" {
+		t.Fatalf("focused tree = %s", got)
 	}
 }
 

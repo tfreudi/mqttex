@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { flatten, digest, columnLabels, buildRows, deviceTopics, pickTopic, rowLimit } from './compare.js';
+import { flatten, digest, columnLabels, buildRows, deviceTopics, pickTopic, rowLimit, deviceFilters } from './compare.js';
 
 const obj = (m) => Object.fromEntries(m);
 
@@ -148,4 +148,39 @@ test('deviceTopics: full topic, empty input, nothing that fits', () => {
   assert.deepEqual(deviceTopics(['/topic/SN1/V0/post/json'], '  '), []);
   assert.deepEqual(deviceTopics(['a/b'], 'xyz'), []);
   assert.deepEqual(deviceTopics([], 'SN1'), []);
+});
+
+test('deviceFilters: one filter per device, where the topics differ', () => {
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN2/V0/post/json']), ['/topic/SN1/#', '/topic/SN2/#']);
+  // Mixed topic forms: no peer of the same depth, the segment with a digit.
+  assert.deepEqual(deviceFilters(['/topic/A1/V0/post/json', '/topic/B2/post/json']), ['/topic/A1/#', '/topic/B2/#']);
+  assert.deepEqual(deviceFilters(['home/kitchen/temp', 'home/bath/temp']), ['home/kitchen/#', 'home/bath/#']);
+  assert.deepEqual(deviceFilters([]), []);
+});
+
+test('deviceFilters: topics of the same device give one filter', () => {
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN1/V0/response']), ['/topic/SN1/#']);
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN1/V0/response', '/topic/SN2/V0/post/json']), [
+    '/topic/SN1/#',
+    '/topic/SN2/#',
+  ]);
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN1/V0/post/json']), ['/topic/SN1/#']);
+  // Same depth, differing only in a segment without a digit: still one device.
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN1/V0/resp/json']), ['/topic/SN1/#']);
+});
+
+test('deviceFilters: a single topic guesses the device, else stays exact', () => {
+  assert.deepEqual(deviceFilters(['/topic/A1B2C3D4/V0/post/json']), ['/topic/A1B2C3D4/#']);
+  assert.deepEqual(deviceFilters(['/topic/SN1/post/json']), ['/topic/SN1/#']);
+  assert.deepEqual(deviceFilters(['a/b']), ['a/b']);
+  // Topics of different depth: guessed per topic.
+  assert.deepEqual(deviceFilters(['dev/x1', 'dev/x1/c']), ['dev/x1/#']);
+});
+
+test('deviceFilters: drops filters covered by another one', () => {
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN1/post/json']), ['/topic/SN1/#']);
+  assert.deepEqual(deviceFilters(['/topic/SN1/V0/post/json', '/topic/SN1/post/json', '/topic/SN2/V0/post/json']), [
+    '/topic/SN1/#',
+    '/topic/SN2/#',
+  ]);
 });

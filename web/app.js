@@ -1,5 +1,5 @@
 import { TopicTree, filterPaste } from './tree.js';
-import { flatten, digest, columnLabels, buildRows, deviceTopics, pickTopic, rowLimit } from './compare.js';
+import { flatten, digest, columnLabels, buildRows, deviceTopics, pickTopic, rowLimit, deviceFilters } from './compare.js';
 import { formatBytes, formatInterval } from './format.js';
 
 const ROW_H = 24;
@@ -49,6 +49,16 @@ let sentCompareKey = ''; // ids the server streams, none while the table is hidd
 let compareDirty = true; // the table has to be updated
 let activeTab = 'topic';
 
+// "Only compared devices": the broker subscription is narrowed to the devices
+// in the comparison. The server owns the state (status.focus); this is the wish.
+const FOCUS_KEY = 'mqttex.focus';
+let focusOn = loadFocus();
+let focusTimer = null;
+// The broker answers (un)subscribes only after its queue, so a switch can take
+// minutes: one request at a time, and changes meanwhile are sent once after it.
+let focusBusy = false;
+let focusAgain = false;
+
 // ---------------------------------------------------------------- toasts
 
 function toast(kind, text) {
@@ -84,15 +94,17 @@ function confirmClick(button, action) {
 
 // ---------------------------------------------------------------- api
 
-async function api(method, path, body) {
+async function api(method, path, body, timeoutMs) {
   let res;
   try {
     res = await fetch(path, {
       method,
       headers: method === 'POST' ? { 'Content-Type': 'application/json' } : {},
       body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
+      signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
     });
-  } catch {
+  } catch (err) {
+    if (err.name === 'TimeoutError') throw new Error(`no answer within ${Math.round(timeoutMs / 1000)} s`);
     throw new Error('the mqttex server is not reachable, is it still running?');
   }
   const data = await res.json().catch(() => ({}));
@@ -171,7 +183,7 @@ function onTick(t) {
   if (t.history && t.selected === selectedId) appendHistory(t.history);
 
   stats = t.stats;
-  status = t.status;
+  setStatus(t.status);
   const now = performance.now();
   if (rateSamples.length && stats.messages < rateSamples.at(-1).m) rateSamples = [];
   rateSamples.push({ t: now, m: stats.messages });
@@ -179,6 +191,14 @@ function onTick(t) {
 
   renderTop();
   scheduleRender();
+}
+
+// A new broker connection starts on the profile subscriptions again, so the
+// focus has to be sent anew once it is up.
+function setStatus(next) {
+  const was = status.state;
+  status = next;
+  if (status.state === 'connected' && was !== 'connected') syncFocus();
 }
 
 // Binary frame: uint32 [type, n, id, count, id, count, ...]
@@ -208,6 +228,12 @@ function renderTop() {
   state.dataset.state = status.state;
   state.textContent = status.profileName ? `${status.state} · ${status.profileName}` : status.state;
   state.title = status.clientId ? `client id ${status.clientId}` : '';
+
+  const subs = status.subscriptions ?? [];
+  $('focus').hidden = !status.focus && !focusBusy;
+  $('focus').classList.toggle('busy', focusBusy);
+  setText($('focus'), focusBusy ? 'focus: switching…' : `focus: ${subs.length} ${subs.length === 1 ? 'device' : 'devices'}`);
+  $('focus').title = focusBusy ? 'Waiting for the broker to switch the subscriptions' : status.focus ? `Subscribed only to ${subs.join(', ')}` : '';
 
   const connected = status.state !== 'disconnected';
   $('connect').textContent = connected ? 'Disconnect' : 'Connect';
@@ -670,6 +696,7 @@ function setCompare(names) {
   saveCompare();
   compareDirty = true;
   syncCompare();
+  syncFocus();
   updateCompareButton();
   scheduleRender();
 }
@@ -940,7 +967,9 @@ $('c-add').addEventListener('submit', (ev) => {
     toast('error', `${name} is already in the comparison.`);
     return;
   }
-  if (tree.idOf(name) < 0) {
+  // With the focus on, the topic of a new device has never been received: it
+  // only arrives once its filter is subscribed, so the best guess is taken.
+  if (!status.focus && tree.idOf(name) < 0) {
     if (full) toast('error', `Could not add ${name}: no message was received on this topic so far.`);
     else toast('error', `Could not add ${value}: no message was received on ${name} or another guessed topic so far. Enter the full topic instead.`);
     return;
@@ -951,6 +980,76 @@ $('c-add').addEventListener('submit', (ev) => {
   }
   $('c-device').value = '';
   setCompare([...compareNames, name]);
+});
+
+function loadFocus() {
+  try {
+    return localStorage.getItem(FOCUS_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function saveFocus() {
+  try {
+    localStorage.setItem(FOCUS_KEY, focusOn ? '1' : '0');
+  } catch {
+    // only a convenience, like the comparison
+  }
+}
+
+// Debounced, because every change makes the server drop its topic table and
+// subscribe again: several quick edits should cost one rebuild.
+function syncFocus() {
+  clearTimeout(focusTimer);
+  focusTimer = setTimeout(applyFocus, 300);
+}
+
+const FOCUS_TIMEOUT_MS = 180_000; // the server itself gives up after about 2 min
+
+async function applyFocus() {
+  if (focusBusy) {
+    focusAgain = true; // latest wins: the state is read again once the request is done
+    return;
+  }
+  if (status.state !== 'connected') return; // the server refuses; sent again once connected
+  const subs = status.subscriptions ?? [];
+  let filters;
+  if (focusOn && compareNames.length > 0) {
+    filters = deviceFilters(compareNames);
+    // Already active, e.g. after a reload or a reconnect of the broker client.
+    if (status.focus && filters.length === subs.length && filters.every((f) => subs.includes(f))) return;
+  } else if (status.focus) {
+    filters = [];
+  } else {
+    return;
+  }
+  setFocusBusy(true);
+  try {
+    setStatus(await api('POST', '/api/focus', { filters }, FOCUS_TIMEOUT_MS));
+  } catch (err) {
+    toast('error', filters.length > 0
+      ? `Could not subscribe to the compared devices only: ${err.message}`
+      : `Could not restore the profile subscriptions: ${err.message}`);
+  }
+  setFocusBusy(false);
+  if (focusAgain) {
+    focusAgain = false;
+    applyFocus();
+  }
+}
+
+function setFocusBusy(busy) {
+  focusBusy = busy;
+  $('c-focus-wait').hidden = !busy;
+  renderTop();
+}
+
+$('c-focus').checked = focusOn;
+$('c-focus').addEventListener('change', () => {
+  focusOn = $('c-focus').checked;
+  saveFocus();
+  syncFocus();
 });
 
 // ---------------------------------------------------------------- publish
@@ -1020,7 +1119,7 @@ async function loadProfiles(selectId) {
 $('connect').addEventListener('click', async () => {
   if (status.state !== 'disconnected') {
     try {
-      status = await api('POST', '/api/disconnect');
+      setStatus(await api('POST', '/api/disconnect'));
     } catch (err) {
       toast('error', `Could not disconnect: ${err.message}`);
     }
@@ -1030,7 +1129,7 @@ $('connect').addEventListener('click', async () => {
   const id = $('profile').value;
   const name = profiles.find((p) => p.id === id)?.name ?? 'the broker';
   try {
-    status = await api('POST', '/api/connect', { id });
+    setStatus(await api('POST', '/api/connect', { id }));
     remember(id);
   } catch (err) {
     toast('error', `Could not start connecting to ${name}: ${err.message}`);

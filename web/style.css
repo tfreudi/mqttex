@@ -118,6 +118,19 @@ textarea { resize: vertical; width: 100%; }
 .state[data-state="connected"]::before { background: var(--ok); }
 .state[data-state="connecting"] { color: var(--warn); }
 .state[data-state="connecting"]::before { background: var(--warn); }
+.focus-badge {
+  padding: 3px 10px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent);
+  font-size: 12px; font-weight: 600;
+}
+.focus-badge.busy { background: var(--warn-soft); color: var(--warn); }
+.focus-wait { display: inline-flex; align-items: center; gap: 6px; color: var(--warn); font-size: 12px; }
+.focus-wait::before {
+  content: ""; width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .stats { display: flex; gap: 18px; margin: 0 0 0 auto; }
 .stats div { display: flex; flex-direction: column; align-items: flex-end; min-width: 56px; }
@@ -228,7 +241,7 @@ textarea { resize: vertical; width: 100%; }
 .value.flash { animation: flash .7s ease-out; }
 @keyframes flash { from { background: var(--flash); } to { background: var(--surface); } }
 @media (prefers-reduced-motion: reduce) {
-  .value.flash, .compare td.flash { animation: none; }
+  .value.flash, .compare td.flash, .focus-wait::before { animation: none; }
   .dot { transition: none; }
 }
 

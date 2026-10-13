@@ -21,6 +21,7 @@
     </div>
 
     <span id="state" class="state" data-state="disconnected" role="status">disconnected</span>
+    <span id="focus" class="focus-badge" hidden></span>
 
     <dl class="stats">
       <div><dt>Topics</dt><dd id="stat-topics">0</dd></div>
@@ -117,6 +118,8 @@
             <button class="btn small" type="submit">Add</button>
           </form>
           <label class="check"><input id="c-diff" type="checkbox"> Only differences</label>
+          <label class="check" title="Load only these devices from the broker: subscribes to /topic/SN/# for each compared device instead of the profile subscriptions"><input id="c-focus" type="checkbox"> Only compared devices</label>
+          <span id="c-focus-wait" class="focus-wait" role="status" hidden>Switching subscriptions…</span>
           <span class="grow"></span>
           <button id="c-clear" class="btn small danger" type="button" title="Remove all topics from the comparison">Clear</button>
         </div>

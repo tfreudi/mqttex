@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/silasmartin/mqttex/internal/broker"
 	"github.com/silasmartin/mqttex/internal/profiles"
@@ -34,6 +35,7 @@ func New(st *store.Store, br *broker.Manager, book *profiles.Book, ui fs.FS, loo
 	s.mux.HandleFunc("POST /api/connect", s.connect)
 	s.mux.HandleFunc("POST /api/disconnect", s.disconnect)
 	s.mux.HandleFunc("POST /api/publish", s.publish)
+	s.mux.HandleFunc("POST /api/focus", s.focus)
 	s.mux.HandleFunc("POST /api/clear", s.clear)
 	s.mux.HandleFunc("GET /ws", s.serveWS)
 	s.mux.Handle("GET /", http.FileServerFS(ui))
@@ -146,6 +148,43 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, struct{}{})
+}
+
+const (
+	maxFocusFilters   = 32
+	maxFocusFilterLen = 1024
+)
+
+func (s *Server) focus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Filters []string `json:"filters"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if len(req.Filters) > maxFocusFilters {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("at most %d filters can be focused, got %d", maxFocusFilters, len(req.Filters)))
+		return
+	}
+	for _, f := range req.Filters {
+		if utf8.RuneCountInString(f) > maxFocusFilterLen {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("topic filter is longer than %d characters", maxFocusFilterLen))
+			return
+		}
+		if err := profiles.ValidateFilter(f); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if err := s.broker.Focus(req.Filters); err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, broker.ErrNotConnected) {
+			code = http.StatusConflict
+		}
+		writeError(w, code, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.broker.Status())
 }
 
 func (s *Server) clear(w http.ResponseWriter, _ *http.Request) {
